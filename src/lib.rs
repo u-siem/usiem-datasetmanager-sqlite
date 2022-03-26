@@ -5,14 +5,10 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::TryFrom;
 use std::sync::{Arc, Mutex};
-use usiem::components::common::{
-    SiemComponentCapabilities, SiemComponentStateStorage, SiemMessage,
-};
+use usiem::components::common::SiemMessage;
 use usiem::components::dataset::geo_ip::{GeoIpDataset, GeoIpInfo, GeoIpSynDataset, UpdateGeoIp};
 use usiem::components::dataset::ip_map::{IpMapDataset, IpMapSynDataset, UpdateIpMap};
-use usiem::components::dataset::ip_map_list::{
-    IpMapListDataset, IpMapListSynDataset, UpdateIpMapList,
-};
+use usiem::components::dataset::ip_map_list::UpdateIpMapList;
 use usiem::components::dataset::ip_net::{IpNetDataset, IpNetSynDataset, UpdateNetIp};
 use usiem::components::dataset::ip_set::{IpSetDataset, IpSetSynDataset, UpdateIpSet};
 use usiem::components::dataset::text_map::{TextMapDataset, TextMapSynDataset, UpdateTextMap};
@@ -21,9 +17,8 @@ use usiem::components::dataset::text_map_list::{
 };
 use usiem::components::dataset::text_set::{TextSetDataset, TextSetSynDataset, UpdateTextSet};
 use usiem::components::dataset::{SiemDataset, SiemDatasetType};
-use usiem::components::{SiemComponent, SiemDatasetManager};
+use usiem::components::SiemDatasetManager;
 use usiem::events::field::SiemIp;
-use usiem::events::SiemLog;
 
 #[derive(Debug)]
 struct KeyValTextMap {
@@ -292,8 +287,8 @@ impl SqliteDatasetManager {
 }
 
 impl SiemDatasetManager for SqliteDatasetManager {
-    fn name(&self) -> Cow<'static, str> {
-        Cow::Borrowed("SiemDatasetManager")
+    fn name(&self) -> &str {
+        &"SqliteDatasetManager"
     }
     fn local_channel(&self) -> Sender<SiemMessage> {
         self.local_chnl_snd.clone()
@@ -455,7 +450,7 @@ impl SiemDatasetManager for SqliteDatasetManager {
                                 match dataset_map_text(&self.conn, &format!("{:?}", data_name)) {
                                     Ok(d) => d,
                                     Err(_) => {
-                                        panic!("Cannot update IpSet dataset")
+                                        panic!("Cannot update TextMap dataset")
                                     }
                                 };
                             match SiemDataset::try_from((
@@ -476,7 +471,7 @@ impl SiemDatasetManager for SqliteDatasetManager {
                             ) {
                                 Ok(d) => d,
                                 Err(_) => {
-                                    panic!("Cannot update IpSet dataset")
+                                    panic!("Cannot update TextMapList dataset")
                                 }
                             };
                             match SiemDataset::try_from((
@@ -495,7 +490,7 @@ impl SiemDatasetManager for SqliteDatasetManager {
                                 match dataset_text_list(&self.conn, &format!("{:?}", data_name)) {
                                     Ok(d) => d,
                                     Err(_) => {
-                                        panic!("Cannot update IpSet dataset")
+                                        panic!("Cannot update TextSet dataset")
                                     }
                                 };
                             match SiemDataset::try_from((
@@ -514,7 +509,7 @@ impl SiemDatasetManager for SqliteDatasetManager {
                                 match dataset_geo_ip_net(&self.conn, &format!("{:?}", data_name)) {
                                     Ok(d) => d,
                                     Err(_) => {
-                                        panic!("Cannot update IpSet dataset")
+                                        panic!("Cannot update GeoIp dataset")
                                     }
                                 };
                             match SiemDataset::try_from((
@@ -534,28 +529,24 @@ impl SiemDatasetManager for SqliteDatasetManager {
             }
             // Update last build time and also Build the references
             match DATASETS.lock() {
-                Ok(mut datasets) => {
-                    match self.comp_channels.lock() {
-                            Ok(comp_channels) => {
-                                loop {
-                                    if new_datasets.is_empty() {
-                                        break;
-                                    } else {
-                                        let dataset = new_datasets.remove(0);
-                                        datasets.insert(dataset.dataset_type(), dataset.clone());
-                                        match comp_channels.get(&dataset.dataset_type()) {
-                                            Some(comps) => {
-                                                for comp_s in comps {
-                                                    let _ = comp_s.send(SiemMessage::Dataset(dataset.clone()));
-                                                }
-                                            },
-                                            None => {}
-                                        }
+                Ok(mut datasets) => match self.comp_channels.lock() {
+                    Ok(comp_channels) => loop {
+                        if new_datasets.is_empty() {
+                            break;
+                        } else {
+                            let dataset = new_datasets.remove(0);
+                            datasets.insert(dataset.dataset_type(), dataset.clone());
+                            match comp_channels.get(&dataset.dataset_type()) {
+                                Some(comps) => {
+                                    for comp_s in comps {
+                                        let _ = comp_s.send(SiemMessage::Dataset(dataset.clone()));
                                     }
                                 }
-                            },
-                            Err(_) => {}
-                    }
+                                None => {}
+                            }
+                        }
+                    },
+                    Err(_) => {}
                 },
                 Err(_) => {}
             }
@@ -580,9 +571,6 @@ impl SiemDatasetManager for SqliteDatasetManager {
                         }
                         SiemDatasetType::CustomIpMap(dataset_name) => {
                             self.create_map_ip(dataset_name);
-                        }
-                        SiemDatasetType::CustomIpList(dataset_name) => {
-                            self.create_map_ip_list(dataset_name);
                         }
                         SiemDatasetType::CustomMapIpNet(dataset_name) => {
                             self.create_map_ip_net(dataset_name);
@@ -717,7 +705,23 @@ impl SiemDatasetManager for SqliteDatasetManager {
                             }
                         }
                         SiemDatasetType::GeoIp => {
-                            self.create_map_ip_net("GeoIp");
+                            self.create_geo_ip_net("GeoIp");
+                            match dataset_geo_ip_net(&self.conn, "GeoIp") {
+                                Ok(d) => match listener {
+                                    UpdateListener::UpdateGeoIp(s, _r, _t) => {
+                                        datasets.insert(
+                                            SiemDatasetType::GeoIp,
+                                            SiemDataset::GeoIp(GeoIpSynDataset::new(
+                                                Arc::from(d),
+                                                s.clone(),
+                                            )),
+                                        );
+                                    }
+                                    _ => {}
+                                },
+                                Err(_) => panic!("Cannot create HostUser"),
+                            }
+
                         }
                         SiemDatasetType::HostUser => {
                             self.create_map_text("HostUser");
@@ -795,24 +799,6 @@ impl SiemDatasetManager for SqliteDatasetManager {
                         }
                         SiemDatasetType::IpHeadquarters => {
                             self.create_map_ip_net("IpHeadquarters");
-                        }
-                        SiemDatasetType::IpHost => {
-                            self.create_map_ip("IpHost");
-                            match dataset_map_ip(&self.conn, "IpHost") {
-                                Ok(d) => match listener {
-                                    UpdateListener::UpdateIpMap(s, _r, _t) => {
-                                        datasets.insert(
-                                            SiemDatasetType::IpHost,
-                                            SiemDataset::IpHost(IpMapSynDataset::new(
-                                                Arc::from(d),
-                                                s.clone(),
-                                            )),
-                                        );
-                                    }
-                                    _ => {}
-                                },
-                                Err(_) => panic!("Cannot create IpHost"),
-                            }
                         }
                         SiemDatasetType::IpMac => {
                             self.create_map_ip("IpMac");
@@ -909,41 +895,37 @@ impl SiemDatasetManager for SqliteDatasetManager {
         let time = chrono::Utc::now().timestamp_millis();
         if !self.registered_datasets.contains_key(&dataset) {
             let listener: UpdateListener = match &dataset {
-                SiemDatasetType::CustomMapText(name) => {
+                SiemDatasetType::CustomMapText(_name) => {
                     let channel = crossbeam_channel::bounded(128);
                     UpdateListener::UpdateTextMap(channel.0, channel.1, time)
                 }
-                SiemDatasetType::CustomIpList(name) => {
+                SiemDatasetType::CustomIpList(_name) => {
                     let channel = crossbeam_channel::bounded(128);
                     UpdateListener::UpdateTextMap(channel.0, channel.1, time)
                 }
-                SiemDatasetType::CustomMapIpNet(name) => {
+                SiemDatasetType::CustomMapIpNet(_name) => {
                     let channel = crossbeam_channel::bounded(128);
                     UpdateListener::UpdateTextMap(channel.0, channel.1, time)
                 }
-                SiemDatasetType::CustomIpMap(name) => {
+                SiemDatasetType::CustomIpMap(_name) => {
                     let channel = crossbeam_channel::bounded(128);
                     UpdateListener::UpdateTextMap(channel.0, channel.1, time)
                 }
-                SiemDatasetType::CustomMapTextList(name) => {
+                SiemDatasetType::CustomMapTextList(_name) => {
                     let channel = crossbeam_channel::bounded(128);
                     UpdateListener::UpdateTextMap(channel.0, channel.1, time)
                 }
-                SiemDatasetType::CustomTextList(name) => {
+                SiemDatasetType::CustomTextList(_name) => {
                     let channel = crossbeam_channel::bounded(128);
                     UpdateListener::UpdateTextMap(channel.0, channel.1, time)
                 }
-                SiemDatasetType::Secrets(name) => {
+                SiemDatasetType::Secrets(_name) => {
                     let channel = crossbeam_channel::bounded(128);
                     UpdateListener::UpdateTextMap(channel.0, channel.1, time)
                 }
                 SiemDatasetType::GeoIp => {
                     let channel = crossbeam_channel::bounded(128);
                     UpdateListener::UpdateGeoIp(channel.0, channel.1, time)
-                }
-                SiemDatasetType::IpHost => {
-                    let channel = crossbeam_channel::bounded(128);
-                    UpdateListener::UpdateIpMap(channel.0, channel.1, time)
                 }
                 SiemDatasetType::IpMac => {
                     let channel = crossbeam_channel::bounded(128);
@@ -1022,26 +1004,26 @@ impl SiemDatasetManager for SqliteDatasetManager {
 fn ip_form_vec8(v: &Vec<u8>) -> Result<SiemIp, ()> {
     if v.len() == 4 {
         return Ok(SiemIp::V4(
-            ((v[0] as u32) << 24) | ((v[1] as u32) << 16) | ((v[2] as u32) << 8) | (v[3] as u32),
+            ((v[3] as u32) << 24) | ((v[2] as u32) << 16) | ((v[1] as u32) << 8) | (v[0] as u32),
         ));
     } else if v.len() == 16 {
         return Ok(SiemIp::V6(
-            ((v[0] as u128) << 120)
-                | ((v[1] as u128) << 112)
-                | ((v[2] as u128) << 104)
-                | ((v[3] as u128) << 96)
-                | ((v[4] as u128) << 88)
-                | ((v[5] as u128) << 80)
-                | ((v[6] as u128) << 72)
-                | ((v[7] as u128) << 64)
-                | ((v[8] as u128) << 56)
-                | ((v[9] as u128) << 48)
-                | ((v[10] as u128) << 40)
-                | ((v[11] as u128) << 32)
-                | ((v[12] as u128) << 24)
-                | ((v[13] as u128) << 16)
-                | ((v[14] as u128) << 8)
-                | (v[15] as u128),
+            ((v[15] as u128) << 120)
+                | ((v[14] as u128) << 112)
+                | ((v[13] as u128) << 104)
+                | ((v[12] as u128) << 96)
+                | ((v[11] as u128) << 88)
+                | ((v[10] as u128) << 80)
+                | ((v[9] as u128) << 72)
+                | ((v[8] as u128) << 64)
+                | ((v[7] as u128) << 56)
+                | ((v[6] as u128) << 48)
+                | ((v[5] as u128) << 40)
+                | ((v[4] as u128) << 32)
+                | ((v[3] as u128) << 24)
+                | ((v[2] as u128) << 16)
+                | ((v[1] as u128) << 8)
+                | (v[0] as u128),
         ));
     } else {
         return Err(());
@@ -1193,10 +1175,120 @@ fn dataset_geo_ip_net(conn: &Connection, name: &str) -> rusqlite::Result<GeoIpDa
 
 #[cfg(test)]
 mod tests {
+    use usiem::{
+        components::{
+            command::{SiemCommandCall, SiemCommandHeader},
+            common::{SiemComponentCapabilities, SiemComponentStateStorage},
+            dataset::holder::DatasetHolder,
+            SiemComponent,
+        },
+        events::SiemLog,
+    };
+
     use super::*;
+
+    #[derive(Clone)]
+    pub struct BasicComponent {
+        /// Send actions to the kernel
+        kernel_sender: Sender<SiemMessage>,
+        /// Send actions to this components
+        local_chnl_snd: Sender<SiemMessage>,
+        /// Receive logs
+        log_receiver: Receiver<SiemLog>,
+        log_sender: Sender<SiemLog>,
+        datasets: DatasetHolder,
+        id: u64,
+    }
+    impl BasicComponent {
+        pub fn new() -> BasicComponent {
+            let (kernel_sender, _receiver) = crossbeam_channel::bounded(1000);
+            let (local_chnl_snd, _local_chnl_rcv) = crossbeam_channel::unbounded();
+            let (log_sender, log_receiver) = crossbeam_channel::unbounded();
+            return BasicComponent {
+                kernel_sender,
+                local_chnl_snd,
+                log_receiver,
+                log_sender,
+                id: 0,
+                datasets: DatasetHolder::new(),
+            };
+        }
+    }
+
+    impl SiemComponent for BasicComponent {
+        fn id(&self) -> u64 {
+            return self.id;
+        }
+        fn set_id(&mut self, id: u64) {
+            self.id = id;
+        }
+        fn name(&self) -> &str {
+            "BasicParser"
+        }
+        fn local_channel(&self) -> Sender<SiemMessage> {
+            self.local_chnl_snd.clone()
+        }
+        fn set_log_channel(&mut self, log_sender: Sender<SiemLog>, receiver: Receiver<SiemLog>) {
+            self.log_receiver = receiver;
+            self.log_sender = log_sender;
+        }
+        fn set_kernel_sender(&mut self, sender: Sender<SiemMessage>) {
+            self.kernel_sender = sender;
+        }
+        fn duplicate(&self) -> Box<dyn SiemComponent> {
+            return Box::new(self.clone());
+        }
+        fn set_datasets(&mut self, datasets: Vec<SiemDataset>) {
+            for dataset in datasets {
+                self.datasets.add(dataset);
+            }
+        }
+        fn run(&mut self) {
+            match self.datasets.get(&SiemDatasetType::IpMac) {
+                Some(dataset) => match dataset {
+                    SiemDataset::IpMac(dataset) => {
+                        for i in 0..10000 {
+                            dataset.insert(SiemIp::V4(i), Cow::Owned(format!("IP:{}", i)));
+                        }
+                    }
+                    _ => {}
+                },
+                None => {}
+            }
+        }
+        fn set_storage(&mut self, _conn: Box<dyn SiemComponentStateStorage>) {}
+
+        /// Capabilities and actions that can be performed on this component
+        fn capabilities(&self) -> SiemComponentCapabilities {
+            SiemComponentCapabilities::new(
+                Cow::Borrowed("BasicDummyComponent"),
+                Cow::Borrowed("Basic dummy component for testing purposes"),
+                Cow::Borrowed(""), // No HTML
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+            )
+        }
+    }
+
+    #[test]
+    fn test_ip_conversion() {
+        let ip100 = SiemIp::V4(100);
+        let arry = ip_to_vec8(&ip100);
+        let ip100_2 = ip_form_vec8(&arry).unwrap();
+        assert_eq!(ip100,ip100_2);
+
+        let ip100 = SiemIp::V6(1234567);
+        let arry = ip_to_vec8(&ip100);
+        let ip100_2 = ip_form_vec8(&arry).unwrap();
+        assert_eq!(ip100,ip100_2);
+    }
 
     #[test]
     fn test_kernel_instance() {
+        let mut comp = BasicComponent::new();
+
         let mut manager = match SqliteDatasetManager::debug() {
             Ok(manager) => manager,
             Err(_) => {
@@ -1204,24 +1296,63 @@ mod tests {
             }
         };
         manager.register_dataset(SiemDatasetType::IpMac);
+        let mut dataset_list = vec![];
+
         let dt = manager.get_datasets();
-        let mut ip_mac = match dt.lock() {
-            Ok(datasets) => match datasets.get(&SiemDatasetType::IpMac) {
-                Some(val) => match val {
-                    SiemDataset::IpMac(syn_dataset) => syn_dataset.clone(),
-                    _ => {
-                        panic!("Dataset is not SiemDataset::IpMac")
-                    }
-                },
-                None => {
-                    panic!("No datasets availables")
+        match dt.lock() {
+            Ok(datasets) => {
+                for (_k,dataset) in datasets.iter() {
+                    dataset_list.push(dataset.clone());
                 }
             },
             Err(_) => {
                 panic!("Cannot access datasets Mutex")
             }
         };
-        let _ = ip_mac.insert(SiemIp::V4(2020), Cow::Borrowed("default_ip"));
-        manager.run()
+        comp.set_datasets(dataset_list);
+
+        let local_chan = manager.local_channel();
+
+        std::thread::spawn(move || manager.run());
+        std::thread::spawn(move || comp.run());
+
+        std::thread::sleep(std::time::Duration::from_secs(7));
+        
+        match dt.lock() {
+            Ok(datasets) => {
+
+                match datasets.get(&SiemDatasetType::IpMac) {
+                    Some(val) => match val {
+                        SiemDataset::IpMac(ip_mac) => {
+                            println!("{:?}",ip_mac);
+                            match ip_mac.get(SiemIp::V4(100)) {
+                                Some(_v) => {}
+                                None => {
+                                    panic!("The component should update the dataset!");
+                                }
+                            }
+                        },
+                        _ => {
+                            panic!("Dataset is not SiemDataset::IpMac")
+                        }
+                    },
+                    None => {
+                        panic!("No datasets availables")
+                    }
+                }
+            },
+            Err(_) => {
+                panic!("Cannot access datasets Mutex")
+            }
+        };
+
+        let _ = local_chan.send(SiemMessage::Command(
+            SiemCommandHeader {
+                user: String::from("None"),
+                comp_id: 0,
+                comm_id: 0,
+            },
+            SiemCommandCall::STOP_COMPONENT("Stop!!".to_string()),
+        ));
     }
 }
