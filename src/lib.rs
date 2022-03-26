@@ -59,7 +59,7 @@ impl SqliteDatasetManager {
         let (local_chnl_snd, local_chnl_rcv) = crossbeam_channel::unbounded();
         let conn = match Connection::open(&path) {
             Ok(conn) => conn,
-            Err(_) => return Err(String::from("")),
+            Err(e) => return Err(format!("{}", e)),
         };
         return Ok(SqliteDatasetManager {
             kernel_sender,
