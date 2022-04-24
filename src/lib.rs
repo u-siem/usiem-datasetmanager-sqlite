@@ -1,14 +1,16 @@
 use crossbeam_channel::{Receiver, Sender};
 use lazy_static::lazy_static;
 use rusqlite::{params, Connection};
+use usiem::components::dataset::holder::DatasetHolder;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::TryFrom;
+use std::sync::atomic::AtomicPtr;
 use std::sync::{Arc, Mutex};
 use usiem::components::common::SiemMessage;
 use usiem::components::dataset::geo_ip::{GeoIpDataset, GeoIpInfo, GeoIpSynDataset, UpdateGeoIp};
 use usiem::components::dataset::ip_map::{IpMapDataset, IpMapSynDataset, UpdateIpMap};
-use usiem::components::dataset::ip_map_list::UpdateIpMapList;
+use usiem::components::dataset::ip_map_list::{UpdateIpMapList, IpMapListSynDataset, IpMapListDataset};
 use usiem::components::dataset::ip_net::{IpNetDataset, IpNetSynDataset, UpdateNetIp};
 use usiem::components::dataset::ip_set::{IpSetDataset, IpSetSynDataset, UpdateIpSet};
 use usiem::components::dataset::text_map::{TextMapDataset, TextMapSynDataset, UpdateTextMap};
@@ -51,7 +53,9 @@ pub struct SqliteDatasetManager {
     local_chnl_snd: Sender<SiemMessage>,
     registered_datasets: BTreeMap<SiemDatasetType, UpdateListener>,
     conn: Connection,
-    comp_channels: Arc<Mutex<BTreeMap<SiemDatasetType, Vec<Sender<SiemMessage>>>>>,
+    dataset_pointers : BTreeMap<SiemDatasetType, Arc<AtomicPtr<SiemDataset>>>,
+    datasets : BTreeMap<SiemDatasetType, SiemDataset>,
+    dataset_holder : DatasetHolder
 }
 impl SqliteDatasetManager {
     pub fn new(path: String) -> Result<SqliteDatasetManager, String> {
@@ -67,7 +71,9 @@ impl SqliteDatasetManager {
             local_chnl_snd,
             registered_datasets: BTreeMap::new(),
             conn,
-            comp_channels: Arc::new(Mutex::new(BTreeMap::new())),
+            dataset_pointers : BTreeMap::new(),
+            datasets : BTreeMap::new(),
+            dataset_holder : DatasetHolder::from_datasets(vec![])
         });
     }
 
@@ -84,10 +90,12 @@ impl SqliteDatasetManager {
             local_chnl_snd,
             registered_datasets: BTreeMap::new(),
             conn,
-            comp_channels: Arc::new(Mutex::new(BTreeMap::new())),
+            dataset_pointers : BTreeMap::new(),
+            datasets : BTreeMap::new(),
+            dataset_holder : DatasetHolder::from_datasets(vec![])
         });
     }
-    fn create_map_text(&self, name: &str) {
+    fn create_text_map(&self, name: &str) {
         let _ = self.conn.execute(&format!("CREATE TABLE IF NOT EXISTS dataset_{dataset_name} (id INTEGER PRIMARY KEY AUTOINCREMENT, data_key TEXT NOT NULL UNIQUE, data_val TEXT NOT NULL);CREATE UNIQUE INDEX IF NOT EXISTS idx_{dataset_name}_data_key ON dataset_{dataset_name} (data_key);", dataset_name = name), []);
     }
 
@@ -96,25 +104,6 @@ impl SqliteDatasetManager {
     }
     fn create_map_ip_net(&self, name: &str) {
         let _ = self.conn.execute(&format!("CREATE TABLE IF NOT EXISTS dataset_{dataset_name} (id INTEGER PRIMARY KEY AUTOINCREMENT, network INTEGER NOT NULL, data_key BLOB NOT NULL, data_val TEXT NOT NULL); CREATE UNIQUE INDEX IF NOT EXISTS idx_{dataset_name}_data_key ON dataset_{dataset_name} (network, data_key);", dataset_name = name), []);
-    }
-    fn dataset_map_ip_net(&self, name: &str) -> rusqlite::Result<IpNetDataset> {
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT network, data_key, data_val FROM dataset_{dataset_name}",
-            dataset_name = name
-        ))?;
-        let iterator = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
-        let mut dataset = IpNetDataset::new();
-
-        for row in iterator {
-            let (n, k, v): (u8, Vec<u8>, String) = row?;
-            match ip_form_vec8(&k) {
-                Ok(k) => {
-                    dataset.insert(k, n, Cow::Owned(v));
-                }
-                Err(_) => {}
-            }
-        }
-        return Ok(dataset);
     }
 
     fn create_geo_ip_net(&self, name: &str) {
@@ -195,7 +184,7 @@ impl SqliteDatasetManager {
         return Ok(());
     }
 
-    fn create_map_ip(&self, name: &str) {
+    fn create_ip_map(&self, name: &str) {
         let _ = self.conn.execute(&format!("CREATE TABLE IF NOT EXISTS dataset_{dataset_name} (id INTEGER PRIMARY KEY AUTOINCREMENT, data_key BLOB NOT NULL UNIQUE, data_val TEXT NOT NULL);CREATE UNIQUE INDEX IF NOT EXISTS idx_{dataset_name}_data_key ON dataset_{dataset_name} (data_key);", dataset_name = name), []);
     }
     fn update_map_ip(&self, name: &str, update: UpdateIpMap) -> rusqlite::Result<()> {
@@ -409,7 +398,7 @@ impl SiemDatasetManager for SqliteDatasetManager {
                         UpdateListener::UpdateIpMap(s, _, t) => {
                             *t = time;
                             let new_dataset =
-                                match dataset_map_ip(&self.conn, &format!("{:?}", data_name)) {
+                                match dataset_ip_map(&self.conn, &format!("{:?}", data_name)) {
                                     Ok(d) => d,
                                     Err(_) => {
                                         panic!("Cannot update MapIp dataset")
@@ -447,7 +436,7 @@ impl SiemDatasetManager for SqliteDatasetManager {
                         UpdateListener::UpdateTextMap(s, _, t) => {
                             *t = time;
                             let new_dataset =
-                                match dataset_map_text(&self.conn, &format!("{:?}", data_name)) {
+                                match dataset_text_map(&self.conn, &format!("{:?}", data_name)) {
                                     Ok(d) => d,
                                     Err(_) => {
                                         panic!("Cannot update TextMap dataset")
@@ -527,476 +516,302 @@ impl SiemDatasetManager for SqliteDatasetManager {
                     None => {}
                 }
             }
+
             // Update last build time and also Build the references
-            match DATASETS.lock() {
-                Ok(mut datasets) => match self.comp_channels.lock() {
-                    Ok(comp_channels) => loop {
-                        if new_datasets.is_empty() {
-                            break;
-                        } else {
-                            let dataset = new_datasets.remove(0);
-                            datasets.insert(dataset.dataset_type(), dataset.clone());
-                            match comp_channels.get(&dataset.dataset_type()) {
-                                Some(comps) => {
-                                    for comp_s in comps {
-                                        let _ = comp_s.send(SiemMessage::Dataset(dataset.clone()));
-                                    }
-                                }
-                                None => {}
-                            }
+            loop {
+                if new_datasets.is_empty() {
+                    break;
+                } else {
+                    let dataset = new_datasets.remove(0);
+                    let typ = dataset.dataset_type();
+                    let dataset_pointer = match self.dataset_pointers.get(&typ) {
+                        Some(dt) => dt,
+                        None => {
+                            panic!("Dataset not found!?!?");
                         }
-                    },
-                    Err(_) => {}
-                },
-                Err(_) => {}
-            }
-        }
-    }
-
-    fn get_datasets(&self) -> Arc<Mutex<BTreeMap<SiemDatasetType, SiemDataset>>> {
-        // Load datasets
-        let data_mutex = Arc::clone(&DATASETS);
-        match data_mutex.lock() {
-            Ok(mut datasets) => {
-                for (dataset_type, listener) in self.registered_datasets.iter() {
-                    match dataset_type {
-                        SiemDatasetType::CustomMapText(dataset_name) => {
-                            self.create_map_text(dataset_name);
+                    };
+                    self.datasets.insert(dataset.dataset_type(), dataset);
+                    let dataset_ref = match self.datasets.get_mut(&typ) {
+                        Some(dt) => dt,
+                        None => {
+                            panic!("Dataset not found!?!?");
                         }
-                        SiemDatasetType::CustomMapTextList(dataset_name) => {
-                            self.create_map_text_list(dataset_name);
-                        }
-                        SiemDatasetType::CustomIpList(dataset_name) => {
-                            self.create_map_ip_list(dataset_name);
-                        }
-                        SiemDatasetType::CustomIpMap(dataset_name) => {
-                            self.create_map_ip(dataset_name);
-                        }
-                        SiemDatasetType::CustomMapIpNet(dataset_name) => {
-                            self.create_map_ip_net(dataset_name);
-                        }
-                        SiemDatasetType::CustomTextList(dataset_name) => {
-                            self.create_text_list(dataset_name);
-                            match dataset_text_list(&self.conn, dataset_name) {
-                                Ok(d) => match listener {
-                                    UpdateListener::UpdateTextSet(s, _r, _t) => {
-                                        datasets.insert(
-                                            SiemDatasetType::CustomTextList(dataset_name.clone()),
-                                            SiemDataset::CustomTextList((
-                                                Cow::Owned(dataset_name.to_string()),
-                                                TextSetSynDataset::new(Arc::from(d), s.clone()),
-                                            )),
-                                        );
-                                    }
-                                    _ => {}
-                                },
-                                Err(_) => panic!("Cannot create CustomTextList"),
-                            };
-                        }
-                        SiemDatasetType::Secrets(dataset_name) => {
-                            self.create_text_list(dataset_name);
-                            match dataset_text_list(&self.conn, dataset_name) {
-                                Ok(d) => match listener {
-                                    UpdateListener::UpdateTextSet(s, _r, _t) => {
-                                        datasets.insert(
-                                            SiemDatasetType::CustomTextList(dataset_name.clone()),
-                                            SiemDataset::CustomTextList((
-                                                Cow::Owned(dataset_name.to_string()),
-                                                TextSetSynDataset::new(Arc::from(d), s.clone()),
-                                            )),
-                                        );
-                                    }
-                                    _ => {}
-                                },
-                                Err(_) => panic!("Cannot create CustomTextList"),
-                            };
-                        }
-                        SiemDatasetType::AssetTag => {
-                            self.create_map_text_list("AssetTag");
-                        }
-                        SiemDatasetType::BlockCountry => {
-                            self.create_map_text_list("BlockCountry");
-                            match dataset_text_list(&self.conn, "BlockCountry") {
-                                Ok(d) => match listener {
-                                    UpdateListener::UpdateTextSet(s, _r, _t) => {
-                                        datasets.insert(
-                                            SiemDatasetType::BlockCountry,
-                                            SiemDataset::BlockCountry(TextSetSynDataset::new(
-                                                Arc::from(d),
-                                                s.clone(),
-                                            )),
-                                        );
-                                    }
-                                    _ => {}
-                                },
-                                Err(_) => panic!("Cannot create BlockCountry"),
-                            }
-                        }
-                        SiemDatasetType::BlockDomain => {
-                            self.create_map_text_list("BlockDomain");
-                            match dataset_text_list(&self.conn, "BlockDomain") {
-                                Ok(d) => match listener {
-                                    UpdateListener::UpdateTextSet(s, _r, _t) => {
-                                        datasets.insert(
-                                            SiemDatasetType::BlockDomain,
-                                            SiemDataset::BlockDomain(TextSetSynDataset::new(
-                                                Arc::from(d),
-                                                s.clone(),
-                                            )),
-                                        );
-                                    }
-                                    _ => {}
-                                },
-                                Err(_) => panic!("Cannot create BlockDomain"),
-                            }
-                        }
-                        SiemDatasetType::BlockEmailSender => {
-                            self.create_map_text_list("BlockEmailSender");
-                            match dataset_text_list(&self.conn, "BlockEmailSender") {
-                                Ok(d) => match listener {
-                                    UpdateListener::UpdateTextSet(s, _r, _t) => {
-                                        datasets.insert(
-                                            SiemDatasetType::BlockEmailSender,
-                                            SiemDataset::BlockEmailSender(TextSetSynDataset::new(
-                                                Arc::from(d),
-                                                s.clone(),
-                                            )),
-                                        );
-                                    }
-                                    _ => {}
-                                },
-                                Err(_) => panic!("Cannot create BlockEmailSender"),
-                            }
-                        }
-                        SiemDatasetType::BlockIp => {
-                            self.create_ip_set("BlockIp");
-                            match dataset_ip_set(&self.conn, "BlockIp") {
-                                Ok(d) => match listener {
-                                    UpdateListener::UpdateIpSet(s, _r, _t) => {
-                                        datasets.insert(
-                                            SiemDatasetType::BlockIp,
-                                            SiemDataset::BlockIp(IpSetSynDataset::new(
-                                                Arc::from(d),
-                                                s.clone(),
-                                            )),
-                                        );
-                                    }
-                                    _ => {}
-                                },
-                                Err(_) => panic!("Cannot create BlockIp"),
-                            }
-                        }
-                        SiemDatasetType::Configuration => {
-                            self.create_map_text("Configuration");
-                            match dataset_map_text(&self.conn, "Configuration") {
-                                Ok(d) => match listener {
-                                    UpdateListener::UpdateTextMap(s, _r, _t) => {
-                                        datasets.insert(
-                                            SiemDatasetType::Configuration,
-                                            SiemDataset::Configuration(TextMapSynDataset::new(
-                                                Arc::from(d),
-                                                s.clone(),
-                                            )),
-                                        );
-                                    }
-                                    _ => {}
-                                },
-                                Err(_) => panic!("Cannot create Configuration"),
-                            }
-                        }
-                        SiemDatasetType::GeoIp => {
-                            self.create_geo_ip_net("GeoIp");
-                            match dataset_geo_ip_net(&self.conn, "GeoIp") {
-                                Ok(d) => match listener {
-                                    UpdateListener::UpdateGeoIp(s, _r, _t) => {
-                                        datasets.insert(
-                                            SiemDatasetType::GeoIp,
-                                            SiemDataset::GeoIp(GeoIpSynDataset::new(
-                                                Arc::from(d),
-                                                s.clone(),
-                                            )),
-                                        );
-                                    }
-                                    _ => {}
-                                },
-                                Err(_) => panic!("Cannot create HostUser"),
-                            }
-
-                        }
-                        SiemDatasetType::HostUser => {
-                            self.create_map_text("HostUser");
-                            match dataset_map_text(&self.conn, "HostUser") {
-                                Ok(d) => match listener {
-                                    UpdateListener::UpdateTextMap(s, _r, _t) => {
-                                        datasets.insert(
-                                            SiemDatasetType::HostUser,
-                                            SiemDataset::HostUser(TextMapSynDataset::new(
-                                                Arc::from(d),
-                                                s.clone(),
-                                            )),
-                                        );
-                                    }
-                                    _ => {}
-                                },
-                                Err(_) => panic!("Cannot create HostUser"),
-                            }
-                        }
-                        SiemDatasetType::HostVulnerable => {
-                            self.create_map_text_list("HostVulnerable");
-                            match dataset_map_text_list(&self.conn, "HostVulnerable") {
-                                Ok(d) => match listener {
-                                    UpdateListener::UpdateTextMapList(s, _r, _t) => {
-                                        datasets.insert(
-                                            SiemDatasetType::HostVulnerable,
-                                            SiemDataset::HostVulnerable(
-                                                TextMapListSynDataset::new(Arc::from(d), s.clone()),
-                                            ),
-                                        );
-                                    }
-                                    _ => {}
-                                },
-                                Err(_) => panic!("Cannot create HostVulnerable"),
-                            }
-                        }
-                        SiemDatasetType::IpCloudProvider => {
-                            self.create_map_ip_net("IpCloudProvider");
-                            match self.dataset_map_ip_net("IpCloudProvider") {
-                                Ok(d) => match listener {
-                                    UpdateListener::UpdateNetIp(s, _r, _t) => {
-                                        datasets.insert(
-                                            SiemDatasetType::IpCloudProvider,
-                                            SiemDataset::IpCloudProvider(IpNetSynDataset::new(
-                                                Arc::from(d),
-                                                s.clone(),
-                                            )),
-                                        );
-                                    }
-                                    _ => {}
-                                },
-                                Err(_) => panic!("Cannot create IpCloudProvider"),
-                            }
-                        }
-                        SiemDatasetType::IpCloudService => {
-                            self.create_map_ip_net("IpCloudService");
-                            match self.dataset_map_ip_net("IpCloudService") {
-                                Ok(d) => match listener {
-                                    UpdateListener::UpdateNetIp(s, _r, _t) => {
-                                        datasets.insert(
-                                            SiemDatasetType::IpCloudService,
-                                            SiemDataset::IpCloudService(IpNetSynDataset::new(
-                                                Arc::from(d),
-                                                s.clone(),
-                                            )),
-                                        );
-                                    }
-                                    _ => {}
-                                },
-                                Err(_) => panic!("Cannot create IpCloudService"),
-                            }
-                        }
-                        SiemDatasetType::IpDNS => {
-                            self.create_map_ip_list("IpDNS");
-                        }
-                        SiemDatasetType::IpHeadquarters => {
-                            self.create_map_ip_net("IpHeadquarters");
-                        }
-                        SiemDatasetType::IpMac => {
-                            self.create_map_ip("IpMac");
-                            match dataset_map_ip(&self.conn, "IpMac") {
-                                Ok(d) => match listener {
-                                    UpdateListener::UpdateIpMap(s, _r, _t) => {
-                                        datasets.insert(
-                                            SiemDatasetType::IpMac,
-                                            SiemDataset::IpMac(IpMapSynDataset::new(
-                                                Arc::from(d),
-                                                s.clone(),
-                                            )),
-                                        );
-                                    }
-                                    _ => {}
-                                },
-                                Err(_) => panic!("Cannot create IpMac"),
-                            }
-                        }
-                        SiemDatasetType::MacHost => {
-                            self.create_map_text("MacHost");
-                            match dataset_map_text(&self.conn, "MacHost") {
-                                Ok(d) => match listener {
-                                    UpdateListener::UpdateTextMap(s, _r, _t) => {
-                                        datasets.insert(
-                                            SiemDatasetType::MacHost,
-                                            SiemDataset::MacHost(TextMapSynDataset::new(
-                                                Arc::from(d),
-                                                s.clone(),
-                                            )),
-                                        );
-                                    }
-                                    _ => {}
-                                },
-                                Err(_) => panic!("Cannot create MacHost"),
-                            }
-                        }
-                        SiemDatasetType::UserHeadquarters => {
-                            self.create_map_text("UserHeadquarters");
-                            match dataset_map_text(&self.conn, "UserHeadquarters") {
-                                Ok(d) => match listener {
-                                    UpdateListener::UpdateTextMap(s, _r, _t) => {
-                                        datasets.insert(
-                                            SiemDatasetType::UserHeadquarters,
-                                            SiemDataset::UserHeadquarters(TextMapSynDataset::new(
-                                                Arc::from(d),
-                                                s.clone(),
-                                            )),
-                                        );
-                                    }
-                                    _ => {}
-                                },
-                                Err(_) => panic!("Cannot create UserHeadquarters"),
-                            }
-                        }
-                        SiemDatasetType::UserTag => {
-                            self.create_map_text_list("UserTag");
-                            match dataset_map_text_list(&self.conn, "UserTag") {
-                                Ok(d) => match listener {
-                                    UpdateListener::UpdateTextMapList(s, _r, _t) => {
-                                        datasets.insert(
-                                            SiemDatasetType::UserTag,
-                                            SiemDataset::UserTag(TextMapListSynDataset::new(
-                                                Arc::from(d),
-                                                s.clone(),
-                                            )),
-                                        );
-                                    }
-                                    _ => {}
-                                },
-                                Err(_) => panic!("Cannot create UserTag"),
-                            }
-                        }
-                        _ => {}
-                    }
+                    };
+                    dataset_pointer.store(dataset_ref, std::sync::atomic::Ordering::Relaxed);
                 }
             }
-            Err(_) => {
-                panic!("Cannot lock DATASET object");
-            }
         }
-
-        // Return datasets
-        return Arc::clone(&DATASETS);
-    }
-    fn set_dataset_channels(
-        &mut self,
-        channels: Arc<Mutex<BTreeMap<SiemDatasetType, Vec<Sender<SiemMessage>>>>>,
-    ) {
-        self.comp_channels = channels;
     }
 
-    fn register_dataset(&mut self, dataset: SiemDatasetType) {
+    fn get_datasets(&self) -> DatasetHolder {
+        self.dataset_holder.clone()
+    }
+    fn register_dataset(&mut self, dataset_type: SiemDatasetType) {
         let time = chrono::Utc::now().timestamp_millis();
-        if !self.registered_datasets.contains_key(&dataset) {
-            let listener: UpdateListener = match &dataset {
-                SiemDatasetType::CustomMapText(_name) => {
+        if !self.registered_datasets.contains_key(&dataset_type) {
+            let (listener, dataset): (UpdateListener, SiemDataset) = match &dataset_type {
+                SiemDatasetType::CustomMapText(name) => {
                     let channel = crossbeam_channel::bounded(128);
-                    UpdateListener::UpdateTextMap(channel.0, channel.1, time)
+                    self.create_text_map(&name);
+                    let dataset = match dataset_text_map(&self.conn, &name) {
+                        Ok(d) => d,
+                        Err(_) => panic!("Cannot init dataset: UserTag")
+                    };
+                    let syn_dataset = TextMapSynDataset::new(Arc::new(dataset),channel.0.clone());
+                    (UpdateListener::UpdateTextMap(channel.0, channel.1, time), SiemDataset::CustomMapText((name.clone(),syn_dataset)))
                 }
-                SiemDatasetType::CustomIpList(_name) => {
+                SiemDatasetType::CustomIpList(name) => {
                     let channel = crossbeam_channel::bounded(128);
-                    UpdateListener::UpdateTextMap(channel.0, channel.1, time)
+                    self.create_ip_set(&name);
+                    let dataset = match dataset_ip_set(&self.conn, &name) {
+                        Ok(d) => d,
+                        Err(_) => panic!("Cannot init dataset: UserTag")
+                    };
+                    let syn_dataset = IpSetSynDataset::new(Arc::new(dataset),channel.0.clone());
+                    (UpdateListener::UpdateIpSet(channel.0, channel.1, time), SiemDataset::CustomIpList((name.clone(),syn_dataset)))
+
                 }
-                SiemDatasetType::CustomMapIpNet(_name) => {
+                SiemDatasetType::CustomMapIpNet(name) => {
                     let channel = crossbeam_channel::bounded(128);
-                    UpdateListener::UpdateTextMap(channel.0, channel.1, time)
+                    self.create_map_ip_net(&name);
+                    let dataset = match dataset_ip_net(&self.conn, &name) {
+                        Ok(d) => d,
+                        Err(_) => panic!("Cannot init dataset: CustomMapIpNet")
+                    };
+                    let syn_dataset = IpNetSynDataset::new(Arc::new(dataset),channel.0.clone());
+                    (UpdateListener::UpdateNetIp(channel.0, channel.1, time), SiemDataset::CustomMapIpNet((name.clone(),syn_dataset)))
                 }
-                SiemDatasetType::CustomIpMap(_name) => {
+                SiemDatasetType::CustomIpMap(name) => {
                     let channel = crossbeam_channel::bounded(128);
-                    UpdateListener::UpdateTextMap(channel.0, channel.1, time)
+                    self.create_ip_map(&name);
+                    let dataset = match dataset_ip_map(&self.conn, &name) {
+                        Ok(d) => d,
+                        Err(_) => panic!("Cannot init dataset: CustomIpMap")
+                    };
+                    let syn_dataset = IpMapSynDataset::new(Arc::new(dataset),channel.0.clone());
+                    (UpdateListener::UpdateIpMap(channel.0, channel.1, time), SiemDataset::CustomIpMap((name.clone(),syn_dataset)))
                 }
-                SiemDatasetType::CustomMapTextList(_name) => {
+                SiemDatasetType::CustomMapTextList(name) => {
                     let channel = crossbeam_channel::bounded(128);
-                    UpdateListener::UpdateTextMap(channel.0, channel.1, time)
+                    self.create_map_text_list(&name);
+                    let dataset = match dataset_map_text_list(&self.conn, &name) {
+                        Ok(d) => d,
+                        Err(_) => panic!("Cannot init dataset: CustomMapTextList")
+                    };
+                    let syn_dataset = TextMapListSynDataset::new(Arc::new(dataset),channel.0.clone());
+                    (UpdateListener::UpdateTextMapList(channel.0, channel.1, time), SiemDataset::CustomMapTextList((name.clone(),syn_dataset)))
                 }
-                SiemDatasetType::CustomTextList(_name) => {
+                SiemDatasetType::CustomTextList(name) => {
                     let channel = crossbeam_channel::bounded(128);
-                    UpdateListener::UpdateTextMap(channel.0, channel.1, time)
+                    self.create_text_list(&name);
+                    let dataset = match dataset_text_list(&self.conn, &name) {
+                        Ok(d) => d,
+                        Err(_) => panic!("Cannot init dataset: CustomTextList")
+                    };
+                    let syn_dataset = TextSetSynDataset::new(Arc::new(dataset),channel.0.clone());
+                    (UpdateListener::UpdateTextSet(channel.0, channel.1, time), SiemDataset::CustomTextList((name.clone(),syn_dataset)))
                 }
-                SiemDatasetType::Secrets(_name) => {
+                SiemDatasetType::Secrets(name) => {
                     let channel = crossbeam_channel::bounded(128);
-                    UpdateListener::UpdateTextMap(channel.0, channel.1, time)
+                    self.create_text_map(&name);
+                    let dataset = match dataset_text_map(&self.conn, &name) {
+                        Ok(d) => d,
+                        Err(_) => panic!("Cannot init dataset: Secrets")
+                    };
+                    let syn_dataset = TextMapSynDataset::new(Arc::new(dataset),channel.0.clone());
+                    (UpdateListener::UpdateTextMap(channel.0, channel.1, time), SiemDataset::Secrets((name.clone(),syn_dataset)))
                 }
                 SiemDatasetType::GeoIp => {
                     let channel = crossbeam_channel::bounded(128);
-                    UpdateListener::UpdateGeoIp(channel.0, channel.1, time)
+                    self.create_geo_ip_net("GeoIp");
+                    let dataset = match dataset_geo_ip_net(&self.conn,"GeoIp") {
+                        Ok(d) => d,
+                        Err(_) => panic!("Cannot init dataset: GeoIp")
+                    };
+                    let syn_dataset = GeoIpSynDataset::new(Arc::new(dataset),channel.0.clone());
+                    (UpdateListener::UpdateGeoIp(channel.0, channel.1, time), SiemDataset::GeoIp(syn_dataset))
                 }
                 SiemDatasetType::IpMac => {
                     let channel = crossbeam_channel::bounded(128);
-                    UpdateListener::UpdateIpMap(channel.0, channel.1, time)
+                    self.create_ip_map("IpMac");
+                    let dataset = match dataset_ip_map(&self.conn,"IpMac") {
+                        Ok(d) => d,
+                        Err(_) => panic!("Cannot init dataset: IpMac")
+                    };
+                    let syn_dataset = IpMapSynDataset::new(Arc::new(dataset),channel.0.clone());
+                    (UpdateListener::UpdateIpMap(channel.0, channel.1, time), SiemDataset::IpMac(syn_dataset))
                 }
                 SiemDatasetType::IpDNS => {
                     let channel = crossbeam_channel::bounded(128);
-                    UpdateListener::UpdateIpMapList(channel.0, channel.1, time)
+                    self.create_map_ip_list("IpDNS");
+                    let dataset = match dataset_ip_map_list(&self.conn,"IpDNS") {
+                        Ok(d) => d,
+                        Err(_) => panic!("Cannot init dataset: IpDNS")
+                    };
+                    let syn_dataset = IpMapListSynDataset::new(Arc::new(dataset),channel.0.clone());
+                    (UpdateListener::UpdateIpMapList(channel.0, channel.1, time), SiemDataset::IpDNS(syn_dataset))
                 }
                 SiemDatasetType::MacHost => {
                     let channel = crossbeam_channel::bounded(128);
-                    UpdateListener::UpdateTextMap(channel.0, channel.1, time)
+                    self.create_text_map("MacHost");
+                    let dataset = match dataset_text_map(&self.conn,"MacHost") {
+                        Ok(d) => d,
+                        Err(_) => panic!("Cannot init dataset: MacHost")
+                    };
+                    let syn_dataset = TextMapSynDataset::new(Arc::new(dataset),channel.0.clone());
+                    (UpdateListener::UpdateTextMap(channel.0, channel.1, time), SiemDataset::MacHost(syn_dataset))
                 }
                 SiemDatasetType::HostUser => {
                     let channel = crossbeam_channel::bounded(128);
-                    UpdateListener::UpdateTextMap(channel.0, channel.1, time)
+                    self.create_text_map("HostUser");
+                    let dataset = match dataset_text_map(&self.conn,"HostUser") {
+                        Ok(d) => d,
+                        Err(_) => panic!("Cannot init dataset: HostUser")
+                    };
+                    let syn_dataset = TextMapSynDataset::new(Arc::new(dataset),channel.0.clone());
+                    (UpdateListener::UpdateTextMap(channel.0, channel.1, time), SiemDataset::HostUser(syn_dataset))
                 }
                 SiemDatasetType::BlockIp => {
                     let channel = crossbeam_channel::bounded(128);
-                    UpdateListener::UpdateIpSet(channel.0, channel.1, time)
+                    self.create_ip_set("BlockIp");
+                    let dataset = match dataset_ip_set(&self.conn,"BlockIp") {
+                        Ok(d) => d,
+                        Err(_) => panic!("Cannot init dataset: BlockIp")
+                    };
+                    let syn_dataset = IpSetSynDataset::new(Arc::new(dataset),channel.0.clone());
+                    (UpdateListener::UpdateIpSet(channel.0, channel.1, time), SiemDataset::BlockIp(syn_dataset))
                 }
                 SiemDatasetType::BlockDomain => {
                     let channel = crossbeam_channel::bounded(128);
-                    UpdateListener::UpdateTextSet(channel.0, channel.1, time)
+                    self.create_text_list("BlockDomain");
+                    let dataset = match dataset_text_list(&self.conn,"BlockDomain") {
+                        Ok(d) => d,
+                        Err(_) => panic!("Cannot init dataset: BlockDomain")
+                    };
+                    let syn_dataset = TextSetSynDataset::new(Arc::new(dataset),channel.0.clone());
+                    (UpdateListener::UpdateTextSet(channel.0, channel.1, time), SiemDataset::BlockDomain(syn_dataset))
                 }
                 SiemDatasetType::BlockEmailSender => {
                     let channel = crossbeam_channel::bounded(128);
-                    UpdateListener::UpdateTextSet(channel.0, channel.1, time)
+                    self.create_text_list("BlockEmailSender");
+                    let dataset = match dataset_text_list(&self.conn,"BlockEmailSender") {
+                        Ok(d) => d,
+                        Err(_) => panic!("Cannot init dataset: BlockEmailSender")
+                    };
+                    let syn_dataset = TextSetSynDataset::new(Arc::new(dataset),channel.0.clone());
+                    (UpdateListener::UpdateTextSet(channel.0, channel.1, time), SiemDataset::BlockEmailSender(syn_dataset))
                 }
                 SiemDatasetType::BlockCountry => {
                     let channel = crossbeam_channel::bounded(128);
-                    UpdateListener::UpdateTextSet(channel.0, channel.1, time)
+                    self.create_text_list("BlockCountry");
+                    let dataset = match dataset_text_list(&self.conn,"BlockCountry") {
+                        Ok(d) => d,
+                        Err(_) => panic!("Cannot init dataset: BlockCountry")
+                    };
+                    let syn_dataset = TextSetSynDataset::new(Arc::new(dataset),channel.0.clone());
+                    (UpdateListener::UpdateTextSet(channel.0, channel.1, time), SiemDataset::BlockCountry(syn_dataset))
                 }
                 SiemDatasetType::HostVulnerable => {
                     let channel = crossbeam_channel::bounded(128);
-                    UpdateListener::UpdateTextMapList(channel.0, channel.1, time)
+                    self.create_ip_map("HostVulnerable");
+                    let dataset = match dataset_map_text_list(&self.conn,"HostVulnerable") {
+                        Ok(d) => d,
+                        Err(_) => panic!("Cannot init dataset: HostVulnerable")
+                    };
+                    let syn_dataset = TextMapListSynDataset::new(Arc::new(dataset),channel.0.clone());
+                    (UpdateListener::UpdateTextMapList(channel.0, channel.1, time), SiemDataset::HostVulnerable(syn_dataset))
                 }
                 SiemDatasetType::UserTag => {
                     let channel = crossbeam_channel::bounded(128);
-                    UpdateListener::UpdateTextMapList(channel.0, channel.1, time)
+                    self.create_map_text_list("UserTag");
+                    let dataset = match dataset_map_text_list(&self.conn, "UserTag") {
+                        Ok(d) => d,
+                        Err(_) => panic!("Cannot init dataset: UserTag")
+                    };
+                    let syn_dataset = TextMapListSynDataset::new(Arc::new(dataset),channel.0.clone());
+                    (UpdateListener::UpdateTextMapList(channel.0, channel.1, time), SiemDataset::UserTag(syn_dataset))
                 }
                 SiemDatasetType::AssetTag => {
                     let channel = crossbeam_channel::bounded(128);
-                    UpdateListener::UpdateTextMapList(channel.0, channel.1, time)
+                    self.create_map_text_list("AssetTag");
+                    let dataset = match dataset_map_text_list(&self.conn, "AssetTag") {
+                        Ok(d) => d,
+                        Err(_) => panic!("Cannot init dataset: AssetTag")
+                    };
+                    let syn_dataset = TextMapListSynDataset::new(Arc::new(dataset),channel.0.clone());
+                    (UpdateListener::UpdateTextMapList(channel.0, channel.1, time), SiemDataset::AssetTag(syn_dataset))
                 }
                 SiemDatasetType::IpCloudService => {
                     let channel = crossbeam_channel::bounded(128);
-                    UpdateListener::UpdateNetIp(channel.0, channel.1, time)
+                    self.create_map_ip_net("IpCloudService");
+                    let dataset = match dataset_ip_net(&self.conn, "IpCloudService") {
+                        Ok(d) => d,
+                        Err(_) => panic!("Cannot init dataset: IpCloudService")
+                    };
+                    let syn_dataset = IpNetSynDataset::new(Arc::new(dataset),channel.0.clone());
+                    (UpdateListener::UpdateNetIp(channel.0, channel.1, time), SiemDataset::IpCloudService(syn_dataset))
                 }
                 SiemDatasetType::IpCloudProvider => {
                     let channel = crossbeam_channel::bounded(128);
-                    UpdateListener::UpdateNetIp(channel.0, channel.1, time)
+                    self.create_map_ip_net("IpCloudProvider");
+                    let dataset = match dataset_ip_net(&self.conn, "IpCloudProvider") {
+                        Ok(d) => d,
+                        Err(_) => panic!("Cannot init dataset: IpCloudProvider")
+                    };
+                    let syn_dataset = IpNetSynDataset::new(Arc::new(dataset),channel.0.clone());
+                    (UpdateListener::UpdateNetIp(channel.0, channel.1, time), SiemDataset::IpCloudProvider(syn_dataset))
                 }
                 SiemDatasetType::UserHeadquarters => {
                     let channel = crossbeam_channel::bounded(128);
-                    UpdateListener::UpdateTextMap(channel.0, channel.1, time)
+                    self.create_text_map("UserHeadquarters");
+                    let dataset = match dataset_text_map(&self.conn, "UserHeadquarters") {
+                        Ok(d) => d,
+                        Err(_) => panic!("Cannot init dataset: UserHeadquarters")
+                    };
+                    let syn_dataset = TextMapSynDataset::new(Arc::new(dataset),channel.0.clone());
+                    (UpdateListener::UpdateTextMap(channel.0, channel.1, time), SiemDataset::UserHeadquarters(syn_dataset))
                 }
                 SiemDatasetType::IpHeadquarters => {
                     let channel = crossbeam_channel::bounded(128);
-                    UpdateListener::UpdateNetIp(channel.0, channel.1, time)
+                    self.create_map_ip_net("IpHeadquarters");
+                    let dataset = match dataset_ip_net(&self.conn, "IpHeadquarters") {
+                        Ok(d) => d,
+                        Err(_) => panic!("Cannot init dataset: IpHeadquarters")
+                    };
+                    let syn_dataset = IpNetSynDataset::new(Arc::new(dataset),channel.0.clone());
+                    (UpdateListener::UpdateNetIp(channel.0, channel.1, time), SiemDataset::IpHeadquarters(syn_dataset))
                 }
                 SiemDatasetType::Configuration => {
                     let channel = crossbeam_channel::bounded(128);
-                    UpdateListener::UpdateTextMap(channel.0, channel.1, time)
+                    self.create_text_map("Configuration");
+                    let dataset = match dataset_text_map(&self.conn, "Configuration") {
+                        Ok(d) => d,
+                        Err(_) => panic!("Cannot init dataset: Configuration")
+                    };
+                    let syn_dataset = TextMapSynDataset::new(Arc::new(dataset),channel.0.clone());
+                    (UpdateListener::UpdateTextMap(channel.0, channel.1, time), SiemDataset::Configuration(syn_dataset))
                 }
                 _ => {
                     println!("Dataset type not defined!!!");
                     return;
                 }
             };
-            self.registered_datasets.insert(dataset, listener);
+            self.registered_datasets.insert(dataset_type.clone(), listener);
+            self.datasets.insert(dataset_type.clone(), dataset);
+            match self.datasets.get_mut(&dataset_type) {
+                Some(v) => {
+                    let pntr = Arc::new(AtomicPtr::new(v));
+                    self.dataset_pointers.insert(dataset_type.clone(), pntr);
+                },
+                None => {
+                    panic!("Cannot found dataset!!!");
+                }
+            };
+            let mut pointer_list = Vec::with_capacity(self.dataset_pointers.len());
+            for (_typ, pntr) in &self.dataset_pointers {
+                pointer_list.push(pntr.clone());
+            }
+            self.dataset_holder = DatasetHolder::from_datasets(pointer_list);
         }
     }
 }
@@ -1066,7 +881,7 @@ fn dataset_text_list(conn: &Connection, name: &str) -> rusqlite::Result<TextSetD
     }
     return Ok(dataset);
 }
-fn dataset_map_ip(conn: &Connection, name: &str) -> rusqlite::Result<IpMapDataset> {
+fn dataset_ip_map(conn: &Connection, name: &str) -> rusqlite::Result<IpMapDataset> {
     let mut stmt = conn.prepare(&format!(
         "SELECT data_key, data_val FROM dataset_{dataset_name}",
         dataset_name = name
@@ -1082,7 +897,39 @@ fn dataset_map_ip(conn: &Connection, name: &str) -> rusqlite::Result<IpMapDatase
     }
     return Ok(dataset);
 }
-fn dataset_map_text(conn: &Connection, name: &str) -> rusqlite::Result<TextMapDataset> {
+fn dataset_ip_map_list(conn: &Connection, name: &str) -> rusqlite::Result<IpMapListDataset> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT data_key, data_val FROM dataset_{dataset_name}",
+        dataset_name = name
+    ))?;
+    let iterator = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    let mut dataset = IpMapListDataset::new();
+    for row in iterator {
+        let (k, v): (Vec<u8>, String) = row?;
+        match ip_form_vec8(&k) {
+            Ok(ip) => dataset.insert(ip, v.split("|").map(|v| Cow::Owned(v.to_string())).collect()),
+            Err(_) => return Err(rusqlite::Error::SqliteSingleThreadedMode),
+        }
+    }
+    return Ok(dataset);
+}
+fn dataset_ip_net(conn: &Connection, name: &str) -> rusqlite::Result<IpNetDataset> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT network, data_key, data_val FROM dataset_{dataset_name}",
+        dataset_name = name
+    ))?;
+    let iterator = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+    let mut dataset = IpNetDataset::new();
+    for row in iterator {
+        let (net, ip, val): (u8, Vec<u8>, String) = row?;
+        match ip_form_vec8(&ip) {
+            Ok(ip) => dataset.insert(ip, net,Cow::Owned(val)),
+            Err(_) => return Err(rusqlite::Error::SqliteSingleThreadedMode),
+        }
+    }
+    return Ok(dataset);
+}
+fn dataset_text_map(conn: &Connection, name: &str) -> rusqlite::Result<TextMapDataset> {
     let mut stmt = conn.prepare(&format!(
         "SELECT data_key, data_val FROM dataset_{dataset_name}",
         dataset_name = name
@@ -1210,7 +1057,7 @@ mod tests {
                 log_receiver,
                 log_sender,
                 id: 0,
-                datasets: DatasetHolder::new(),
+                datasets: DatasetHolder::from_datasets(vec![]),
             };
         }
     }
@@ -1238,10 +1085,8 @@ mod tests {
         fn duplicate(&self) -> Box<dyn SiemComponent> {
             return Box::new(self.clone());
         }
-        fn set_datasets(&mut self, datasets: Vec<SiemDataset>) {
-            for dataset in datasets {
-                self.datasets.add(dataset);
-            }
+        fn set_datasets(&mut self, datasets: DatasetHolder) {
+            self.datasets = datasets;
         }
         fn run(&mut self) {
             match self.datasets.get(&SiemDatasetType::IpMac) {
@@ -1296,55 +1141,36 @@ mod tests {
             }
         };
         manager.register_dataset(SiemDatasetType::IpMac);
-        let mut dataset_list = vec![];
 
-        let dt = manager.get_datasets();
-        match dt.lock() {
-            Ok(datasets) => {
-                for (_k,dataset) in datasets.iter() {
-                    dataset_list.push(dataset.clone());
-                }
-            },
-            Err(_) => {
-                panic!("Cannot access datasets Mutex")
-            }
-        };
+        let dataset_list = manager.get_datasets();
         comp.set_datasets(dataset_list);
 
         let local_chan = manager.local_channel();
-
+        let dataset_list = manager.get_datasets();
         std::thread::spawn(move || manager.run());
         std::thread::spawn(move || comp.run());
 
         std::thread::sleep(std::time::Duration::from_secs(7));
         
-        match dt.lock() {
-            Ok(datasets) => {
-
-                match datasets.get(&SiemDatasetType::IpMac) {
-                    Some(val) => match val {
-                        SiemDataset::IpMac(ip_mac) => {
-                            println!("{:?}",ip_mac);
-                            match ip_mac.get(SiemIp::V4(100)) {
-                                Some(_v) => {}
-                                None => {
-                                    panic!("The component should update the dataset!");
-                                }
-                            }
-                        },
-                        _ => {
-                            panic!("Dataset is not SiemDataset::IpMac")
+        
+        match dataset_list.get(&SiemDatasetType::IpMac) {
+            Some(val) => match val {
+                SiemDataset::IpMac(ip_mac) => {
+                    match ip_mac.get(&SiemIp::V4(100)) {
+                        Some(_v) => {}
+                        None => {
+                            panic!("The component should update the dataset!");
                         }
-                    },
-                    None => {
-                        panic!("No datasets availables")
                     }
+                },
+                _ => {
+                    panic!("Dataset is not SiemDataset::IpMac")
                 }
             },
-            Err(_) => {
-                panic!("Cannot access datasets Mutex")
+            None => {
+                panic!("No datasets availables")
             }
-        };
+        }
 
         let _ = local_chan.send(SiemMessage::Command(
             SiemCommandHeader {
